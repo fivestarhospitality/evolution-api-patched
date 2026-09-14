@@ -29,4 +29,4 @@ jobs:
           pull: true
           push: true
           provenance: false
-          tags: ghcr.io/fivestarhospitality/evolution-api-patched:2.4.0-rc2-lp
+          tags: ghcr.io/fivestarhospitality/evolution-api-patched:2.4.0-rc2-lp2

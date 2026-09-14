@@ -119,3 +119,113 @@ node --check "$MAIN_JS" || fail "final $MAIN_JS is not valid JavaScript"
 
 echo "==> sha256 after:  $(sha256sum "$MAIN_JS" | cut -d' ' -f1)"
 echo "==> OK: generateLinkPreview now returns undefined immediately"
+
+# ---------------------------------------------------------------------------
+# Patch 2: raise Baileys' inline link-preview thumbnail width.
+#
+# Evolution creates the socket with generateHighQualityLinkPreview:!0 but never
+# sets linkPreviewImageThumbnailWidth, so Baileys embeds a 192 px JPEG. Channels
+# cannot fetch the high-res CDN copy and stretch that thumbnail full width.
+# Insert linkPreviewImageThumbnailWidth:640 into the same makeWASocket config.
+# ---------------------------------------------------------------------------
+
+echo
+echo "==> [patch 2] sha256 before: $(sha256sum "$MAIN_JS" | cut -d' ' -f1)"
+
+echo "==> [patch 2] node --check before"
+node --check "$MAIN_JS" || fail "patch 2: $MAIN_JS is not valid JavaScript before patching"
+
+MAIN_JS="$MAIN_JS" TMP_JS="$TMP_JS" node <<'EOF' || fail "patch 2: could not apply edit (see message above)"
+const fs = require('fs');
+
+const src = fs.readFileSync(process.env.MAIN_JS, 'utf8');
+
+const KEY = 'generateHighQualityLinkPreview:!0';
+const INSERT = 'linkPreviewImageThumbnailWidth:640,';
+// The socket config is a local object literal handed straight to Baileys'
+// default export (makeWASocket), with `_` bound to require("baileys").
+const BAILEYS_IMPORT = '_=R(require("baileys"))';
+const OBJ_HEAD = 'let a={...r,version:o,';
+const OBJ_TAIL = '};return this.endSession=!1,this.client=(0,_.default)(a),';
+
+function die(msg) {
+  console.error('PATCH FAILED: patch 2: ' + msg);
+  process.exit(1);
+}
+
+function count(haystack, needle) {
+  let n = 0;
+  for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + 1)) n++;
+  return n;
+}
+
+const keyCount = count(src, KEY);
+if (keyCount !== 1) die(`expected exactly 1 occurrence of "${KEY}", found ${keyCount}`);
+if (count(src, 'generateHighQualityLinkPreview') !== 1) die('generateHighQualityLinkPreview appears in more than one form');
+const existing = count(src, 'linkPreviewImageThumbnailWidth');
+if (existing !== 0) die(`linkPreviewImageThumbnailWidth is already present (${existing} occurrence(s))`);
+
+// Confirm the enclosing object literal is the makeWASocket config.
+if (count(src, BAILEYS_IMPORT) !== 1) die(`expected exactly 1 "${BAILEYS_IMPORT}"`);
+if (count(src, OBJ_HEAD) !== 1) die(`expected exactly 1 "${OBJ_HEAD}"`);
+if (count(src, OBJ_TAIL) !== 1) die(`expected exactly 1 "${OBJ_TAIL}"`);
+
+const keyIdx = src.indexOf(KEY);
+const objStart = src.indexOf(OBJ_HEAD) + OBJ_HEAD.indexOf('{');
+if (objStart > keyIdx || keyIdx - objStart > 5000) die('key is not inside the socket config object');
+
+let depth = 0;
+let keyDepth = -1;
+let objEnd = -1;
+for (let i = objStart; i < src.length && i - objStart < 10000; i++) {
+  if (i === keyIdx) keyDepth = depth;
+  const ch = src[i];
+  if (ch === '{') depth++;
+  else if (ch === '}' && --depth === 0) { objEnd = i; break; }
+}
+if (objEnd === -1) die('could not find end of socket config object');
+if (!src.startsWith(OBJ_TAIL, objEnd)) die('object containing the key is not the one passed to makeWASocket');
+if (keyIdx > objEnd) die('key lies outside the socket config object');
+if (keyDepth !== 1) die(`key is nested (depth ${keyDepth}), not a direct property of the socket config`);
+
+const obj = src.slice(objStart, objEnd + 1);
+for (const marker of ['auth:{creds:', 'printQRInTerminal:', 'getMessage:', 'patchMessageBeforeSending(']) {
+  if (!obj.includes(marker)) die(`socket config object lacks "${marker}"`);
+}
+
+const insertAt = keyIdx + KEY.length;
+if (src[insertAt] !== ',') die(`expected "," after "${KEY}", found "${src[insertAt]}"`);
+const pos = insertAt + 1;
+const out = src.slice(0, pos) + INSERT + src.slice(pos);
+
+// Verify the result is exactly the original plus the inserted text.
+if (out.slice(0, pos) + out.slice(pos + INSERT.length) !== src) die('output is not original + insertion');
+if (count(out, KEY + ',' + INSERT) !== 1) die('inserted property not found exactly once in output');
+if (count(out, 'linkPreviewImageThumbnailWidth') !== 1) die('linkPreviewImageThumbnailWidth count is not 1 in output');
+
+fs.writeFileSync(process.env.TMP_JS, out);
+
+const ctxFrom = src.lastIndexOf(',', keyIdx - 1) + 1;
+const ctxTo = src.indexOf(',', pos) + 1;
+console.log('==> [patch 2] Offset: ' + pos + ' (inside makeWASocket config, ' + obj.length + ' chars)');
+console.log('==> [patch 2] REMOVED: nothing');
+console.log('==> [patch 2] INSERTED (' + INSERT.length + ' chars): ' + INSERT);
+console.log('==> [patch 2] before: ' + src.slice(ctxFrom, ctxTo));
+console.log('==> [patch 2] after:  ' + out.slice(ctxFrom, ctxTo + INSERT.length));
+EOF
+
+[ -s "$TMP_JS" ] || fail "patch 2: patched output was not written"
+
+echo "==> [patch 2] node --check on patched bundle"
+node --check "$TMP_JS" || fail "patch 2: patched bundle is not valid JavaScript"
+
+mv -f "$TMP_JS" "$MAIN_JS"
+
+grep -qF 'generateHighQualityLinkPreview:!0,linkPreviewImageThumbnailWidth:640,getMessage:' "$MAIN_JS" \
+  || fail "patch 2: inserted property not found in $MAIN_JS after replacing it"
+grep -qF 'async generateLinkPreview(e){return void 0}async sendMessage(' "$MAIN_JS" \
+  || fail "patch 2: patch 1 no longer present in $MAIN_JS"
+node --check "$MAIN_JS" || fail "patch 2: final $MAIN_JS is not valid JavaScript"
+
+echo "==> [patch 2] sha256 after:  $(sha256sum "$MAIN_JS" | cut -d' ' -f1)"
+echo "==> OK: makeWASocket config now sets linkPreviewImageThumbnailWidth:640"
